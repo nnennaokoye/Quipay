@@ -13,6 +13,10 @@ const Navbar: React.FC = () => {
 
   const navLinks = [
     { to: "/dashboard", label: t("nav.dashboard"), shortcut: "Ctrl+D" },
+    {
+      to: "/dashboard-customization",
+      label: t("nav.customize_dashboard"),
+    },
     { to: "/payroll", label: t("nav.payroll") },
     {
       to: "/treasury-management",
@@ -25,25 +29,25 @@ const Navbar: React.FC = () => {
       label: t("nav.workforce"),
       tourId: "tour-workforce-nav",
     },
-    { to: "/address-book", label: "Address Book" },
+    { to: "/address-book", label: t("nav.address_book") },
     { to: "/reports", label: t("nav.reports") },
     { to: "/analytics", label: t("nav.analytics") },
-    { to: "/templates", label: "Templates" },
+    { to: "/templates", label: t("nav.templates") },
     { to: "/governance", label: t("nav.governance") },
     {
       to: "/withdraw",
-      label: t("nav.withdraw") || "Withdraw",
+      label: t("nav.withdraw"),
       shortcut: "Ctrl+W",
     },
     {
       to: "/create-stream",
-      label: t("nav.create_stream") || "New Stream",
+      label: t("nav.create_stream"),
       shortcut: "Ctrl+N",
       tourId: "tour-create-stream-nav",
     },
     {
       to: "/settings",
-      label: t("nav.settings") || "Settings",
+      label: t("nav.settings"),
       shortcut: "Ctrl+,",
     },
   ];

@@ -24,6 +24,11 @@ import {
   startPayrollReportScheduler,
   stopPayrollReportScheduler,
 } from "./scheduler/reportScheduler";
+import { streamsRouter } from "./routes/streams";
+import { startStellarListener } from "./stellarListener";
+import { startScheduler, getSchedulerStatus } from "./scheduler/scheduler";
+import { startMonitor, runMonitorCycle } from "./monitor/monitor";
+import { startPayrollReportScheduler } from "./scheduler/reportScheduler";
 import {
   initWebSocketServer,
   shutdownWebSocketServer,
@@ -39,6 +44,7 @@ import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
 import { strictRateLimiter } from "./middleware/rateLimiter";
 import { secretsBootstrap } from "./services/secretsBootstrap";
 import { requestIdMiddleware } from "./middleware/requestId";
+import { httpLoggerMiddleware } from "./middleware/httpLogger";
 import { requireMonitorStatusAdminToken } from "./middleware/monitorStatusAuth";
 import { getHealthResponse } from "./health";
 import { stopSyncer } from "./syncer";
@@ -98,7 +104,7 @@ app.use(
   }),
 ); // For Slack form data
 
-// Add X-Request-ID generation/forwarding via AsyncLocalStorage
+// Add X-Request-ID / X-Correlation-ID generation/forwarding via AsyncLocalStorage
 app.use(requestIdMiddleware);
 
 app.use((req, res, next) => {
@@ -108,6 +114,8 @@ app.use((req, res, next) => {
   }
   next();
 });
+// Emit one structured JSON log line per request (correlationId, method, path, statusCode, durationMs)
+app.use(httpLoggerMiddleware);
 
 // Initialize database and audit logger
 async function initializeServices() {
@@ -139,6 +147,8 @@ app.use("/api/employers", employersRouter);
 app.use("/proofs", proofsRouter);
 app.use("/stellar", stellarRouter);
 app.use("/reports", reportsRouter);
+app.use("/streams", streamsRouter);
+app.use("/api/streams", streamsRouter);
 
 // Start time for uptime calculation
 const startTime = Date.now();
