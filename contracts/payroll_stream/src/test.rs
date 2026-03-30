@@ -706,6 +706,51 @@ fn test_batch_withdraw_atomic_reverts_all_when_any_payout_fails() {
 }
 
 #[test]
+fn test_large_duration_does_not_produce_negative_total_amount() {
+    // Regression test for #752: u64-to-i64 cast silently wraps when
+    // duration > i64::MAX, producing a negative total_amount.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let worker = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let vault_id = env.register_contract(None, dummy_vault::DummyVault);
+    let contract_id = env.register_contract(None, PayrollStream);
+    let client = PayrollStreamClient::new(&env, &contract_id);
+
+    client.init(&admin);
+    client.set_min_stream_duration(&0u64);
+    client.set_max_stream_duration(&u64::MAX);
+    client.set_vault(&vault_id);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 0;
+    });
+
+    // duration = i64::MAX + 1 is the first value that silently wraps to
+    // i64::MIN when cast as i64, making the old code store a huge negative
+    // total_amount.
+    let duration: u64 = i64::MAX as u64 + 1;
+    let rate: i128 = 1;
+    let expected_total = rate * duration as i128;
+
+    let stream_id = client.create_stream(
+        &employer, &worker, &token, &rate, &0u64, &0u64, &duration, &None, &None,
+    );
+
+    let stream = client.get_stream(&stream_id).unwrap();
+    assert!(
+        stream.total_amount > 0,
+        "total_amount must be positive, got {}",
+        stream.total_amount
+    );
+    assert_eq!(stream.total_amount, expected_total);
+}
+
+#[test]
 fn test_index_get_streams_by_employer() {
     let env = Env::default();
     env.mock_all_auths();
@@ -738,6 +783,42 @@ fn test_index_get_streams_by_employer() {
     assert_eq!(ids.len(), 2);
     assert_eq!(ids.get(0).unwrap(), id1);
     assert_eq!(ids.get(1).unwrap(), id2);
+}
+
+#[test]
+fn test_get_stream_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let worker = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let vault_id = env.register_contract(None, dummy_vault::DummyVault);
+    let contract_id = env.register_contract(None, PayrollStream);
+    let client = PayrollStreamClient::new(&env, &contract_id);
+
+    client.init(&admin);
+    client.set_min_stream_duration(&0u64);
+    client.set_vault(&vault_id);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 0;
+    });
+
+    // No streams yet — count should be zero
+    assert_eq!(client.get_stream_count(&employer), 0);
+
+    client.create_stream(
+        &employer, &worker, &token, &10, &0u64, &0u64, &100u64, &None, &None,
+    );
+    assert_eq!(client.get_stream_count(&employer), 1);
+
+    client.create_stream(
+        &employer, &worker, &token, &20, &0u64, &0u64, &200u64, &None, &None,
+    );
+    assert_eq!(client.get_stream_count(&employer), 2);
 }
 
 #[test]
@@ -1811,6 +1892,98 @@ fn test_get_claimable() {
 }
 
 #[test]
+fn test_simulate_balance_at() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, employer, worker, token, _) = setup(&env);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 0;
+    });
+
+    // rate=1, start=0, end=100 → 1 token/second, 100 tokens total (linear)
+    let stream_id = client.create_stream(
+        &employer, &worker, &token, &1, &0u64, &0u64, &100u64, &None, &None,
+    );
+
+    // At start: no time elapsed, 0 tokens accrued
+    assert_eq!(client.simulate_balance_at(&stream_id, &0u64), 0);
+
+    // Mid-stream: 50 seconds elapsed, 50 tokens accrued
+    assert_eq!(client.simulate_balance_at(&stream_id, &50u64), 50);
+
+    // At end: 100 tokens accrued
+    assert_eq!(client.simulate_balance_at(&stream_id, &100u64), 100);
+
+    // Matches get_withdrawable at current timestamp when no withdrawals have been made
+    env.ledger().with_mut(|li| {
+        li.timestamp = 75;
+    });
+    assert_eq!(
+        client.simulate_balance_at(&stream_id, &75u64),
+        client.get_withdrawable(&stream_id).unwrap(),
+    );
+}
+
+#[test]
+fn test_simulate_balance_at_out_of_range_after_end() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, employer, worker, token, _) = setup(&env);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 0;
+    });
+
+    let stream_id = client.create_stream(
+        &employer, &worker, &token, &1, &0u64, &0u64, &100u64, &None, &None,
+    );
+
+    // timestamp > end_ts must be rejected
+    let result = client.try_simulate_balance_at(&stream_id, &101u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_simulate_balance_at_out_of_range_before_start() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, employer, worker, token, _) = setup(&env);
+
+    // Create stream starting in the future so there is a valid "before start" timestamp
+    env.ledger().with_mut(|li| {
+        li.timestamp = 10;
+    });
+
+    let stream_id = client.create_stream(
+        &employer, &worker, &token, &1, &0u64, &20u64, &120u64, &None, &None,
+    );
+
+    // timestamp < start_ts must be rejected
+    let result = client.try_simulate_balance_at(&stream_id, &15u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_simulate_balance_at_stream_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, employer, worker, token, _) = setup(&env);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 0;
+    });
+
+    // Create a real stream so the contract is initialised, then query a non-existent ID
+    client.create_stream(
+        &employer, &worker, &token, &1, &0u64, &0u64, &100u64, &None, &None,
+    );
+
+    let result = client.try_simulate_balance_at(&999u64, &50u64);
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_pagination() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1856,12 +2029,12 @@ fn test_batch_create_streams_succeeds() {
         make_stream_params(&employer, &worker, &token, 50, 0, 50),
     ];
 
-    let stream_ids = client.batch_create_streams(&params);
+    let stream_ids = client.create_stream_batch(&params, &0i128);
 
     assert_eq!(stream_ids.len(), 3);
-    assert_eq!(stream_ids.get(0).unwrap(), 1u32);
-    assert_eq!(stream_ids.get(1).unwrap(), 2u32);
-    assert_eq!(stream_ids.get(2).unwrap(), 3u32);
+    assert_eq!(stream_ids.get(0).unwrap(), 1u64);
+    assert_eq!(stream_ids.get(1).unwrap(), 2u64);
+    assert_eq!(stream_ids.get(2).unwrap(), 3u64);
 
     let first = client.get_stream(&1u64).unwrap();
     assert_eq!(first.total_amount, 10000);
@@ -1890,7 +2063,7 @@ fn test_batch_create_streams_rejects_more_than_twenty() {
         ));
     }
 
-    let result = client.try_batch_create_streams(&params);
+    let result = client.try_create_stream_batch(&params, &0i128);
     let contract_err = result.unwrap_err().unwrap();
     assert_eq!(contract_err, QuipayError::BatchTooLarge);
 }
@@ -1971,16 +2144,16 @@ fn test_batch_create_with_mixed_cliff_times() {
         },
     ];
 
-    let stream_ids = client.batch_create_streams(&params);
+    let stream_ids = client.create_stream_batch(&params, &0i128);
     assert_eq!(stream_ids.len(), 3);
 
     env.ledger().with_mut(|li| {
         li.timestamp = 25;
     });
 
-    let stream1_id = stream_ids.get(0).unwrap() as u64;
-    let stream2_id = stream_ids.get(1).unwrap() as u64;
-    let stream3_id = stream_ids.get(2).unwrap() as u64;
+    let stream1_id = stream_ids.get(0).unwrap();
+    let stream2_id = stream_ids.get(1).unwrap();
+    let stream3_id = stream_ids.get(2).unwrap();
 
     let amount1 = client.withdraw(&stream1_id, &worker);
     assert!(amount1 > 0);
@@ -2426,7 +2599,8 @@ fn test_pause_and_cancel_interaction() {
 
     // Create a 100s stream with rate 100 (total 10,000)
     let stream_id = client.create_stream(
-        &employer, &worker, &token, &100, &0u64, &0u64, &100u64, &None, &None,
+        &employer, &worker, &token, &100, &0u64, &0u64, &100u64, &None,
+        &None,
     );
 
     // Fast forward to t=20 (Vested: 20 * 100 = 2000)
@@ -2473,7 +2647,8 @@ fn test_transfer_stream_success() {
     });
 
     let stream_id = client.create_stream(
-        &employer, &worker1, &token, &100, &0u64, &0u64, &100u64, &None, &None,
+        &employer, &worker1, &token, &100, &0u64, &0u64, &100u64, &None,
+        &None,
     );
 
     // Accrue some balance for worker1 (total duration 100s, rate 100 -> total_amount 10000)
@@ -2519,7 +2694,8 @@ fn test_transfer_stream_unauthorized() {
     });
 
     let stream_id = client.create_stream(
-        &employer, &worker1, &token, &100, &0u64, &0u64, &100u64, &None, &None,
+        &employer, &worker1, &token, &100, &0u64, &0u64, &100u64, &None,
+        &None,
     );
 
     // Intruder attempts to transfer
@@ -2540,7 +2716,8 @@ fn test_transfer_stream_closed_fails() {
     });
 
     let stream_id = client.create_stream(
-        &employer, &worker1, &token, &100, &0u64, &0u64, &100u64, &None, &None,
+        &employer, &worker1, &token, &100, &0u64, &0u64, &100u64, &None,
+        &None,
     );
 
     // Cancel the stream

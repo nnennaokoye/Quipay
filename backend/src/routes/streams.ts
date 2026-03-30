@@ -48,6 +48,7 @@ const createStreamSchema = z.object({
   endTs: z.number().int().positive(),
   status: z.enum(["active", "completed", "cancelled"]).default("active"),
   ledger: z.number().int().positive(),
+  metadata: z.record(z.string(), z.string()).optional(),
 });
 
 const cancelStreamSchema = z.object({
@@ -151,7 +152,7 @@ streamsRouter.delete(
 
     const deleted = await softDeleteStream({
       streamId,
-      deletedBy: req.user.stellarAddress ?? req.user.id,
+      deletedBy: req.user.id,
       cancelReason: req.body.cancelReason,
     });
 
@@ -165,7 +166,7 @@ streamsRouter.delete(
       streamId,
       status: "cancelled",
       cancelledAt: new Date().toISOString(),
-      cancelledBy: req.user.stellarAddress ?? req.user.id,
+      cancelledBy: req.user.id,
     });
   },
 );

@@ -1149,3 +1149,478 @@ export const getProofByStreamId = async (
   );
   return res.rows[0] ?? null;
 };
+
+// ─── Dashboard analytics queries ─────────────────────────────────────────────
+
+export interface VolumePoint {
+  bucket: string; // ISO date string (day or week)
+  xlm_volume: string;
+  usdc_volume: string;
+  total_volume: string;
+  stream_count: number;
+}
+
+export interface TopWorker {
+  worker: string;
+  total_earned: string;
+  stream_count: number;
+  last_withdrawal_at: string | null;
+}
+
+export interface StreamCreationPoint {
+  bucket: string;
+  streams_created: number;
+}
+
+export interface WithdrawalFrequencyPoint {
+  bucket: string;
+  withdrawal_count: number;
+  total_withdrawn: string;
+}
+
+/**
+ * Total XLM/USDC streamed per day or week.
+ * Uses vault_events for token-level breakdown; falls back to payroll_streams volume.
+ */
+export const getVolumeOverTime = async (
+  granularity: "daily" | "weekly" = "daily",
+  days = 30,
+): Promise<VolumePoint[]> => {
+  if (!getPool()) return [];
+  const trunc = granularity === "weekly" ? "week" : "day";
+  const res = await query<VolumePoint>(
+    `SELECT
+        date_trunc('${trunc}', created_at)::date::text          AS bucket,
+        COALESCE(SUM(total_amount) FILTER (
+          WHERE LOWER(worker) LIKE '%xlm%' OR LOWER(employer) LIKE '%xlm%'
+        ), 0)                                                    AS xlm_volume,
+        COALESCE(SUM(total_amount) FILTER (
+          WHERE LOWER(worker) NOT LIKE '%xlm%' AND LOWER(employer) NOT LIKE '%xlm%'
+        ), 0)                                                    AS usdc_volume,
+        COALESCE(SUM(total_amount), 0)                           AS total_volume,
+        COUNT(*)                                                 AS stream_count
+      FROM payroll_streams
+      WHERE deleted_at IS NULL
+        AND created_at >= NOW() - INTERVAL '${days} days'
+      GROUP BY 1
+      ORDER BY 1 ASC`,
+  );
+  return res.rows.map((r) => ({
+    ...r,
+    stream_count: Number(r.stream_count),
+  }));
+};
+
+/**
+ * Top workers ranked by total withdrawn amount.
+ */
+export const getTopWorkersByEarnings = async (
+  limit = 10,
+): Promise<TopWorker[]> => {
+  if (!getPool()) return [];
+  const res = await query<TopWorker>(
+    `SELECT
+        w.worker,
+        COALESCE(SUM(w.amount), 0)                              AS total_earned,
+        COUNT(DISTINCT w.stream_id)                             AS stream_count,
+        MAX(w.created_at)::text                                 AS last_withdrawal_at
+      FROM withdrawals w
+      GROUP BY w.worker
+      ORDER BY total_earned DESC
+      LIMIT $1`,
+    [limit],
+  );
+  return res.rows.map((r) => ({
+    ...r,
+    stream_count: Number(r.stream_count),
+  }));
+};
+
+/**
+ * Stream creation rate per day or week.
+ */
+export const getStreamCreationRate = async (
+  granularity: "daily" | "weekly" = "daily",
+  days = 30,
+): Promise<StreamCreationPoint[]> => {
+  if (!getPool()) return [];
+  const trunc = granularity === "weekly" ? "week" : "day";
+  const res = await query<StreamCreationPoint>(
+    `SELECT
+        date_trunc('${trunc}', created_at)::date::text  AS bucket,
+        COUNT(*)                                         AS streams_created
+      FROM payroll_streams
+      WHERE deleted_at IS NULL
+        AND created_at >= NOW() - INTERVAL '${days} days'
+      GROUP BY 1
+      ORDER BY 1 ASC`,
+  );
+  return res.rows.map((r) => ({
+    ...r,
+    streams_created: Number(r.streams_created),
+  }));
+};
+
+/**
+ * Withdrawal frequency per day or week.
+ */
+export const getWithdrawalFrequency = async (
+  granularity: "daily" | "weekly" = "daily",
+  days = 30,
+): Promise<WithdrawalFrequencyPoint[]> => {
+  if (!getPool()) return [];
+  const trunc = granularity === "weekly" ? "week" : "day";
+  const res = await query<WithdrawalFrequencyPoint>(
+    `SELECT
+        date_trunc('${trunc}', created_at)::date::text  AS bucket,
+        COUNT(*)                                         AS withdrawal_count,
+        COALESCE(SUM(amount), 0)                         AS total_withdrawn
+      FROM withdrawals
+      WHERE created_at >= NOW() - INTERVAL '${days} days'
+      GROUP BY 1
+      ORDER BY 1 ASC`,
+  );
+  return res.rows.map((r) => ({
+    ...r,
+    withdrawal_count: Number(r.withdrawal_count),
+  }));
+};
+
+// ─── Employer Spend Analytics ─────────────────────────────────────────────────
+
+export const getEmployerSpendBreakdown = async (
+  employer: string,
+  period: "monthly" | "weekly" | "daily" = "monthly",
+): Promise<
+  Array<{
+    worker: string;
+    department?: string;
+    project?: string;
+    role?: string;
+    period_start: string;
+    total_spend: number;
+  }>
+> => {
+  if (!getPool()) return [];
+  const interval =
+    period === "monthly" ? "month" : period === "weekly" ? "week" : "day";
+  const res = await query(
+    `SELECT
+       s.worker,
+       s.metadata->>'department' as department,
+       s.metadata->>'project' as project,
+       s.metadata->>'role' as role,
+       DATE_TRUNC('${interval}', TO_TIMESTAMP(s.start_ts))::text as period_start,
+       SUM(s.total_amount::numeric) as total_spend
+     FROM payroll_streams s
+     WHERE s.employer = $1 AND s.status = 'active'
+     GROUP BY s.worker, s.metadata->>'department', s.metadata->>'project', s.metadata->>'role', DATE_TRUNC('${interval}', TO_TIMESTAMP(s.start_ts))
+     ORDER BY period_start DESC, total_spend DESC`,
+    [employer],
+  );
+  return res.rows.map((r) => ({
+    worker: r.worker,
+    department: r.department || undefined,
+    project: r.project || undefined,
+    role: r.role || undefined,
+    period_start: r.period_start,
+    total_spend: Number(r.total_spend),
+  }));
+};
+
+// ─── Payslip Records ──────────────────────────────────────────────────────────
+
+export interface PayslipRecord {
+  id: number;
+  payslip_id: string;
+  worker_address: string;
+  period: string;
+  signature: string;
+  branding_snapshot: any;
+  pdf_url: string | null;
+  total_gross_amount: string;
+  stream_ids: number[];
+  generated_at: Date;
+}
+
+export interface InsertPayslipRecordParams {
+  payslipId: string;
+  workerAddress: string;
+  period: string;
+  signature: string;
+  brandingSnapshot: any;
+  pdfUrl?: string;
+  totalGrossAmount: string;
+  streamIds: number[];
+}
+
+/**
+ * Insert a new payslip record
+ * Uses ON CONFLICT to ensure idempotency per worker per period
+ */
+export const insertPayslipRecord = async (
+  params: InsertPayslipRecordParams,
+): Promise<PayslipRecord> => {
+  const pool = getPool();
+  if (!pool) throw new Error("Database pool not initialized");
+
+  const res = await query<PayslipRecord>(
+    `INSERT INTO payslip_records (
+      payslip_id,
+      worker_address,
+      period,
+      signature,
+      branding_snapshot,
+      pdf_url,
+      total_gross_amount,
+      stream_ids
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    ON CONFLICT (worker_address, period) 
+    DO UPDATE SET
+      signature = EXCLUDED.signature,
+      branding_snapshot = EXCLUDED.branding_snapshot,
+      pdf_url = EXCLUDED.pdf_url,
+      total_gross_amount = EXCLUDED.total_gross_amount,
+      stream_ids = EXCLUDED.stream_ids,
+      generated_at = NOW()
+    RETURNING *`,
+    [
+      params.payslipId,
+      params.workerAddress,
+      params.period,
+      params.signature,
+      JSON.stringify(params.brandingSnapshot),
+      params.pdfUrl || null,
+      params.totalGrossAmount,
+      params.streamIds,
+    ],
+  );
+
+  return res.rows[0];
+};
+
+/**
+ * Get payslip by worker address and period
+ * Used for idempotency - check if payslip already exists
+ */
+export const getPayslipByWorkerAndPeriod = async (
+  workerAddress: string,
+  period: string,
+): Promise<PayslipRecord | null> => {
+  const pool = getPool();
+  if (!pool) return null;
+
+  const res = await query<PayslipRecord>(
+    `SELECT * FROM payslip_records
+     WHERE worker_address = $1 AND period = $2`,
+    [workerAddress, period],
+  );
+
+  return res.rows[0] || null;
+};
+
+/**
+ * Get payslip by signature
+ * Used for signature verification
+ */
+export const getPayslipBySignature = async (
+  signature: string,
+): Promise<PayslipRecord | null> => {
+  const pool = getPool();
+  if (!pool) return null;
+
+  const res = await query<PayslipRecord>(
+    `SELECT * FROM payslip_records
+     WHERE signature = $1`,
+    [signature],
+  );
+
+  return res.rows[0] || null;
+};
+
+/**
+ * Query payslip records with filters
+ */
+export interface QueryPayslipRecordsParams {
+  workerAddress?: string;
+  period?: string;
+  startDate?: Date;
+  endDate?: Date;
+  limit?: number;
+  offset?: number;
+}
+
+export const queryPayslipRecords = async (
+  params: QueryPayslipRecordsParams,
+): Promise<PayslipRecord[]> => {
+  const pool = getPool();
+  if (!pool) return [];
+
+  const conditions: string[] = [];
+  const values: any[] = [];
+  let paramIndex = 1;
+
+  if (params.workerAddress) {
+    conditions.push(`worker_address = $${paramIndex++}`);
+    values.push(params.workerAddress);
+  }
+
+  if (params.period) {
+    conditions.push(`period = $${paramIndex++}`);
+    values.push(params.period);
+  }
+
+  if (params.startDate) {
+    conditions.push(`generated_at >= $${paramIndex++}`);
+    values.push(params.startDate);
+  }
+
+  if (params.endDate) {
+    conditions.push(`generated_at <= $${paramIndex++}`);
+    values.push(params.endDate);
+  }
+
+  const whereClause =
+    conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = params.limit || 50;
+  const offset = params.offset || 0;
+
+  const res = await query<PayslipRecord>(
+    `SELECT * FROM payslip_records
+     ${whereClause}
+     ORDER BY generated_at DESC
+     LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
+    [...values, limit, offset],
+  );
+
+  return res.rows;
+};
+
+/**
+ * Get all payslips for a worker
+ */
+export const getPayslipsByWorker = async (
+  workerAddress: string,
+  limit = 50,
+  offset = 0,
+): Promise<PayslipRecord[]> => {
+  return queryPayslipRecords({ workerAddress, limit, offset });
+};
+
+// ─── Employer Branding ────────────────────────────────────────────────────────
+
+export interface EmployerBrandingRecord {
+  id: number;
+  employer_address: string;
+  logo_url: string | null;
+  logo_metadata: any;
+  primary_color: string;
+  secondary_color: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface UpsertEmployerBrandingParams {
+  employerAddress: string;
+  logoUrl?: string;
+  logoMetadata?: any;
+  primaryColor?: string;
+  secondaryColor?: string;
+}
+
+/**
+ * Upsert employer branding settings
+ */
+export const upsertEmployerBranding = async (
+  params: UpsertEmployerBrandingParams,
+): Promise<EmployerBrandingRecord> => {
+  const pool = getPool();
+  if (!pool) throw new Error("Database pool not initialized");
+
+  const updates: string[] = [];
+  const values: any[] = [params.employerAddress];
+  let paramIndex = 2;
+
+  if (params.logoUrl !== undefined) {
+    updates.push(`logo_url = $${paramIndex++}`);
+    values.push(params.logoUrl);
+  }
+
+  if (params.logoMetadata !== undefined) {
+    updates.push(`logo_metadata = $${paramIndex++}`);
+    values.push(JSON.stringify(params.logoMetadata));
+  }
+
+  if (params.primaryColor !== undefined) {
+    updates.push(`primary_color = $${paramIndex++}`);
+    values.push(params.primaryColor);
+  }
+
+  if (params.secondaryColor !== undefined) {
+    updates.push(`secondary_color = $${paramIndex++}`);
+    values.push(params.secondaryColor);
+  }
+
+  updates.push(`updated_at = NOW()`);
+
+  const setClause = updates.join(", ");
+
+  const res = await query<EmployerBrandingRecord>(
+    `INSERT INTO employer_branding (
+      employer_address,
+      logo_url,
+      logo_metadata,
+      primary_color,
+      secondary_color
+    ) VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (employer_address)
+    DO UPDATE SET ${setClause}
+    RETURNING *`,
+    [
+      params.employerAddress,
+      params.logoUrl || null,
+      params.logoMetadata ? JSON.stringify(params.logoMetadata) : null,
+      params.primaryColor || "#2563eb",
+      params.secondaryColor || "#64748b",
+    ],
+  );
+
+  return res.rows[0];
+};
+
+/**
+ * Get employer branding by address
+ */
+export const getEmployerBranding = async (
+  employerAddress: string,
+): Promise<EmployerBrandingRecord | null> => {
+  const pool = getPool();
+  if (!pool) return null;
+
+  const res = await query<EmployerBrandingRecord>(
+    `SELECT * FROM employer_branding
+     WHERE employer_address = $1`,
+    [employerAddress],
+  );
+
+  return res.rows[0] || null;
+};
+
+/**
+ * Delete employer logo (set to null)
+ */
+export const deleteEmployerLogo = async (
+  employerAddress: string,
+): Promise<void> => {
+  const pool = getPool();
+  if (!pool) throw new Error("Database pool not initialized");
+
+  await query(
+    `UPDATE employer_branding
+     SET logo_url = NULL,
+         logo_metadata = NULL,
+         updated_at = NOW()
+     WHERE employer_address = $1`,
+    [employerAddress],
+  );
+};

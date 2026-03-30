@@ -36,6 +36,9 @@ pub enum DataKey {
     EmployerStreamLimit(Address), // Per-employer maximum active stream override
     MinStreamDuration,       // Configurable minimum stream duration in seconds
     Receipt,                 // PayrollReceipt contract address (optional)
+    ScheduledPause,          // u64 effective timestamp
+    EmergencyMultisig,       // Vec<Address> (3 authorized keys)
+    EmergencyPauseVotes,     // Vec<Address> (keys that voted for current pause)
 }
 
 #[contracttype]
@@ -229,6 +232,10 @@ const MAX_EARLY_CANCEL_FEE_BPS: u32 = 1000;
 const UPGRADE_PROPOSED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("up_prop");
 const UPGRADE_EXECUTED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("up_exec");
 const UPGRADE_CANCELED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("up_cancel");
+const PAUSE_SCHEDULED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("p_sched");
+const PAUSE_CANCELED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("p_cancel");
+const EMERGENCY_PAUSED: soroban_sdk::Symbol = soroban_sdk::symbol_short!("em_pause");
+const PAUSE_TIMELOCK_DURATION: u64 = 24 * 60 * 60;
 
 #[contract]
 pub struct PayrollStream;
@@ -256,15 +263,118 @@ impl PayrollStream {
             .get(&DataKey::Admin)
             .ok_or(QuipayError::NotInitialized)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &paused);
+        if paused {
+            let now = env.ledger().timestamp();
+            let effective_at = now.saturating_add(PAUSE_TIMELOCK_DURATION);
+            env.storage().instance().set(&DataKey::ScheduledPause, &effective_at);
+            env.events().publish(
+                (Symbol::new(&env, "admin"), PAUSE_SCHEDULED),
+                effective_at,
+            );
+        } else {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            env.storage().instance().remove(&DataKey::ScheduledPause);
+            env.storage().instance().remove(&DataKey::EmergencyPauseVotes);
+        }
         Ok(())
     }
 
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return true;
+        }
+        if let Some(scheduled_ts) =
+            env.storage().instance().get::<DataKey, u64>(&DataKey::ScheduledPause)
+        {
+            if env.ledger().timestamp() >= scheduled_ts {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn cancel_pause(env: Env) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
             .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::ScheduledPause) {
+            env.storage().instance().remove(&DataKey::ScheduledPause);
+            env.events().publish((Symbol::new(&env, "admin"), PAUSE_CANCELED), ());
+        }
+        Ok(())
+    }
+
+    pub fn get_scheduled_pause(env: Env) -> Option<u64> {
+        env.storage().instance().get(&DataKey::ScheduledPause)
+    }
+
+    pub fn set_emergency_multisig(env: Env, addresses: Vec<Address>) -> Result<(), QuipayError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(QuipayError::NotInitialized)?;
+        admin.require_auth();
+
+        require!(addresses.len() == 3, QuipayError::Custom);
+        env.storage().instance().set(&DataKey::EmergencyMultisig, &addresses);
+        Ok(())
+    }
+
+    pub fn get_emergency_multisig(env: Env) -> Option<Vec<Address>> {
+        env.storage().instance().get(&DataKey::EmergencyMultisig)
+    }
+
+    pub fn emergency_pause(env: Env, caller: Address) -> Result<(), QuipayError> {
+        caller.require_auth();
+        let multisig: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyMultisig)
+            .ok_or(QuipayError::NotInitialized)?;
+
+        let mut is_member = false;
+        for i in 0..multisig.len() {
+            if multisig.get(i).unwrap() == caller {
+                is_member = true;
+                break;
+            }
+        }
+        require!(is_member, QuipayError::Unauthorized);
+
+        let mut votes: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyPauseVotes)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut already_voted = false;
+        for i in 0..votes.len() {
+            if votes.get(i).unwrap() == caller {
+                already_voted = true;
+                break;
+            }
+        }
+
+        if !already_voted {
+            votes.push_back(caller);
+            env.storage().instance().set(&DataKey::EmergencyPauseVotes, &votes);
+        }
+
+        if votes.len() >= 2 {
+            env.storage().instance().set(&DataKey::Paused, &true);
+            env.storage().instance().remove(&DataKey::ScheduledPause);
+            env.storage().instance().remove(&DataKey::EmergencyPauseVotes);
+            env.events().publish(
+                (Symbol::new(&env, "admin"), EMERGENCY_PAUSED),
+                (),
+            );
+        }
+        Ok(())
     }
 
     pub fn set_retention_secs(env: Env, retention_secs: u64) -> Result<(), QuipayError> {
@@ -589,75 +699,145 @@ impl PayrollStream {
         Ok(stream_id)
     }
 
-    pub fn batch_create_streams(
+    /// Creates multiple streams atomically and optionally deposits a lump sum into the vault.
+    /// This is significantly more gas-efficient than calling create_stream individually
+    /// as it groups vault interactions into single calls.
+    pub fn create_stream_batch(
         env: Env,
         params: Vec<StreamParams>,
-    ) -> Result<Vec<u32>, QuipayError> {
+        vault_deposit: i128,
+    ) -> Result<Vec<u64>, QuipayError> {
         Self::require_not_paused(&env)?;
 
         if params.len() > MAX_BATCH_CREATE_STREAMS {
             return Err(QuipayError::BatchTooLarge);
         }
-
         if params.is_empty() {
             return Ok(Vec::new(&env));
         }
 
+        // All streams in a batch must share the same employer and token for atomic funding
         let first_param = params.get(0).ok_or(QuipayError::InvalidAmount)?;
         let authorized_employer = first_param.employer.clone();
+        let token = first_param.token.clone();
         authorized_employer.require_auth();
 
-        let mut stream_ids = Vec::new(&env);
-        let mut index = 0u32;
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Vault)
+            .ok_or(QuipayError::NotInitialized)?;
 
-        while index < params.len() {
-            let Some(param) = params.get(index) else {
-                index += 1;
-                continue;
-            };
+        let mut total_liability: i128 = 0;
+        let mut validated_params = Vec::new(&env);
 
-            if param.employer != authorized_employer {
-                return Err(QuipayError::Unauthorized);
+        // Phase 1: Pre-validation and liability calculation
+        for param in params.iter() {
+            if param.employer != authorized_employer || param.token != token {
+                return Err(QuipayError::Custom); // Batch must be homogeneous (same employer/token)
+            }
+            
+            if param.rate <= 0 || param.end_ts <= param.start_ts {
+                return Err(QuipayError::InvalidAmount);
             }
 
-            let stream_id = Self::create_stream_internal(
-                env.clone(),
-                param.employer.clone(),
-                param.worker.clone(),
-                param.token.clone(),
-                param.rate,
-                param.cliff_ts,
-                param.start_ts,
-                param.end_ts,
-                param.metadata_hash.clone(),
-                match param.speed_curve {
-                    MaybeSpeedCurve::Some(c) => Some(c),
-                    MaybeSpeedCurve::None => None,
-                },
-            )?;
-
-            env.events().publish(
-                (
-                    Symbol::new(&env, "stream"),
-                    Symbol::new(&env, "created"),
-                    param.worker,
-                    param.employer,
-                ),
-                (
-                    stream_id,
-                    param.token,
-                    param.rate,
-                    param.start_ts,
-                    param.end_ts,
-                ),
-            );
-
-            let stream_id = u32::try_from(stream_id).map_err(|_| QuipayError::Overflow)?;
-            stream_ids.push_back(stream_id);
-            index += 1;
+            let duration = param.end_ts.saturating_sub(param.start_ts);
+            let duration_i = i128::try_from(duration).map_err(|_| QuipayError::Overflow)?;
+            let stream_total = param.rate
+                .checked_mul(duration_i)
+                .ok_or(QuipayError::Overflow)?;
+            
+            total_liability = total_liability.checked_add(stream_total).ok_or(QuipayError::Overflow)?;
+            validated_params.push_back(param);
         }
 
-        Ok(stream_ids)
+        // Phase 2: Atomic Vault Interaction
+        if vault_deposit > 0 {
+            // Optionally fund the treasury first
+            env.invoke_contract::<()>(
+                &vault,
+                &Symbol::new(&env, "deposit"),
+                soroban_sdk::vec![&env, authorized_employer.into_val(&env), token.into_val(&env), vault_deposit.into_val(&env)],
+            );
+        }
+
+        // Single solvency check for the entire batch
+        let solvent: bool = env.invoke_contract(
+            &vault,
+            &Symbol::new(&env, "check_solvency"),
+            soroban_sdk::vec![&env, token.clone().into_val(&env), total_liability.into_val(&env)],
+        );
+        require!(solvent, QuipayError::InsufficientBalance);
+
+        // Single liability update
+        env.invoke_contract::<()>(
+            &vault,
+            &Symbol::new(&env, "add_liability"),
+            soroban_sdk::vec![&env, token.clone().into_val(&env), total_liability.into_val(&env)],
+        );
+
+        // Phase 3: Record Creation
+        let mut next_id: u64 = env.storage().instance().get(&DataKey::NextStreamId).unwrap_or(1);
+        let mut created_ids = Vec::new(&env);
+        let now = env.ledger().timestamp();
+
+        for param in validated_params.iter() {
+            let stream_id = next_id;
+            next_id += 1;
+
+            let duration_i = i128::try_from(param.end_ts - param.start_ts)
+                .map_err(|_| QuipayError::Overflow)?;
+            let total_amount = param.rate
+                .checked_mul(duration_i)
+                .ok_or(QuipayError::Overflow)?;
+
+            let stream = Stream {
+                employer: authorized_employer.clone(),
+                worker: param.worker.clone(),
+                token: token.clone(),
+                rate: param.rate,
+                cliff_ts: if param.cliff_ts <= param.start_ts { param.start_ts } else { param.cliff_ts },
+                start_ts: param.start_ts,
+                end_ts: param.end_ts,
+                total_amount,
+                withdrawn_amount: 0,
+                last_withdrawal_ts: 0,
+                status: StreamStatus::Active,
+                created_at: now,
+                closed_at: 0,
+                paused_at: 0,
+                total_paused_duration: 0,
+                metadata_hash: param.metadata_hash.clone(),
+                cancel_effective_at: 0,
+                speed_curve: match param.speed_curve { MaybeSpeedCurve::Some(c) => c, _ => stream_curve::SpeedCurve::Linear },
+            };
+
+            env.storage().persistent().set(&StreamKey::Stream(stream_id), &stream);
+            created_ids.push_back(stream_id);
+
+            // Update employer index
+            let emp_key = StreamKey::EmployerStreams(authorized_employer.clone());
+            let mut emp_ids: Vec<u64> = env.storage().persistent().get(&emp_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            emp_ids.push_back(stream_id);
+            env.storage().persistent().set(&emp_key, &emp_ids);
+
+            // Update worker index
+            let wrk_key = StreamKey::WorkerStreams(param.worker.clone());
+            let mut wrk_ids: Vec<u64> = env.storage().persistent().get(&wrk_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            wrk_ids.push_back(stream_id);
+            env.storage().persistent().set(&wrk_key, &wrk_ids);
+
+            // Emit individual events for downstream indexers
+            env.events().publish(
+                (Symbol::new(&env, "stream"), Symbol::new(&env, "created"), param.worker.clone(), authorized_employer.clone()),
+                (stream_id, token.clone(), param.rate, param.start_ts, param.end_ts),
+            );
+        }
+
+        env.storage().instance().set(&DataKey::NextStreamId, &next_id);
+        Ok(created_ids)
     }
 
     /// Withdraw vested funds from a stream.
@@ -1638,8 +1818,7 @@ impl PayrollStream {
         Ok(stream_id)
     }
 
-    /// Cancel a stream via an authorized AutomationGateway on behalf of an employer.
-    /// Only the registered gateway can call this method.
+
     pub fn cancel_stream_via_gateway(
         env: Env,
         stream_id: u64,
@@ -1779,8 +1958,9 @@ impl PayrollStream {
         }
 
         let duration = end_ts - start_ts;
+        let duration_i = i128::try_from(duration).map_err(|_| QuipayError::Overflow)?;
         let total_amount = rate
-            .checked_mul(i128::from(duration as i64))
+            .checked_mul(duration_i)
             .ok_or(QuipayError::Overflow)?;
 
         let vault: Address = env
@@ -1944,6 +2124,32 @@ impl PayrollStream {
         Some(core::cmp::min(streamed_claimable, vault_balance))
     }
 
+    /// Returns the accrued (vested) balance of a stream at a specific historical timestamp.
+    ///
+    /// Read-only; does not modify state. Useful for point-in-time accounting and
+    /// month-end close queries without requiring an external indexer.
+    ///
+    /// Returns `Err(QuipayError::StreamNotFound)` when no stream exists for `stream_id`.
+    /// Returns `Err(QuipayError::InvalidTimeRange)` when `timestamp` is outside
+    /// `[stream.start_ts, stream.end_ts]`.
+    pub fn simulate_balance_at(
+        env: Env,
+        stream_id: u64,
+        timestamp: u64,
+    ) -> Result<i128, QuipayError> {
+        let stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&StreamKey::Stream(stream_id))
+            .ok_or(QuipayError::StreamNotFound)?;
+
+        if timestamp < stream.start_ts || timestamp > stream.end_ts {
+            return Err(QuipayError::InvalidTimeRange);
+        }
+
+        Ok(Self::vested_amount_at(&stream, timestamp))
+    }
+
     /// Check if a stream is currently solvent (vault has enough funds to cover remaining liability)
     pub fn is_stream_solvent(env: Env, stream_id: u64) -> Option<bool> {
         let key = StreamKey::Stream(stream_id);
@@ -2063,6 +2269,14 @@ impl PayrollStream {
             .unwrap_or_else(|| Vec::new(&env));
 
         Self::paginate(&env, ids, offset, limit)
+    }
+
+    pub fn get_stream_count(env: Env, employer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&StreamKey::EmployerStreams(employer))
+            .map(|ids| ids.len())
+            .unwrap_or(0)
     }
 
     pub fn get_streams_by_worker(
@@ -2262,12 +2476,7 @@ impl PayrollStream {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), QuipayError> {
-        if env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
+        if Self::is_paused(env.clone()) {
             return Err(QuipayError::ProtocolPaused);
         }
         Ok(())
@@ -2393,6 +2602,8 @@ impl PayrollStream {
         else {
             return;
         };
+        // ClosureReason enum discriminant is passed as u32 to avoid a cross-crate
+        // contracttype dependency at the call site.
         let _ = env.try_invoke_contract::<u64, soroban_sdk::Error>(
             &receipt_addr,
             &Symbol::new(env, "mint"),
@@ -2411,6 +2622,10 @@ impl PayrollStream {
         );
     }
 
+    /// Calculate the vested amount at a specific timestamp, accounting for pauses.
+    ///
+    /// Subtracts `total_paused_duration` from elapsed time so workers are only
+    /// paid for active (non-paused) time. Caps the result at `total_amount`.
     pub(crate) fn vested_amount_at(stream: &Stream, timestamp: u64) -> i128 {
         let is_closed = Self::is_closed(stream);
         let mut effective_ts = if is_closed {
@@ -2496,6 +2711,7 @@ impl PayrollStream {
 mod dispute;
 mod extension_test;
 mod pause_test;
+mod pause_timelock_test;
 mod stream_extension;
 mod stream_pause;
 
